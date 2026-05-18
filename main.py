@@ -35,15 +35,29 @@ class ValuationRequest(BaseModel):
     building_age: Optional[int] = None
     total_floors: Optional[int] = None
     current_floor: Optional[int] = None
-    # Arsa/Arazi
-    zoning: Optional[str] = None
+    cephe: Optional[str] = None            # guney / kuzey / dogu / bati ...
+    isitma_tipi: Optional[str] = None      # kombi / merkezi / klima / soba ...
+    site_icinde: Optional[str] = None      # evet / hayir
+    otopark: Optional[str] = None          # yok / acik / kapali
+    asansor: Optional[str] = None          # evet / hayir
+
+    # Arsa/Arazi özellikleri (Endeksa Modeli)
+    imar_tipi: Optional[str] = None        # konut / konut_ticari / villa / koyici / ticari / imarsiz
+    hisseli: Optional[str] = None          # evet / hayir
+    hmax: Optional[float] = None
+    max_floor: Optional[int] = None
+    taks: Optional[float] = None
+    kaks: Optional[float] = None
+    yapilasma_durumu: Optional[str] = None # bos / kullanilan / metruk
+    olanaklar: Optional[str] = None        # elektrik,su,yol...
+    manzara: Optional[str] = None          # sehir,doga...
 
 
 def get_base_price(req: ValuationRequest) -> float:
     """Şehir ve mülk tipine göre temel m2 fiyatını hesapla"""
 
     # Temel m2 fiyatları (2025 yaklaşık değerleri)
-    base = 35000 if req.property_type == 'apartment' else 8000
+    base = 35000 if req.property_type == 'apartment' else 4000  # Arsa taban fiyatını 4000'e çekelim (imarlı için)
 
     # Şehir çarpanları
     city_multipliers = {
@@ -58,6 +72,14 @@ def get_base_price(req: ValuationRequest) -> float:
 
     city_key = req.city.lower()
     base *= city_multipliers.get(city_key, 0.85)
+
+    # Arsa için boyut indirimi (Area decay factor - Büyük parsel indirimi)
+    # Büyük parsellerin birim m2 fiyatı düşer
+    if req.property_type == 'land':
+        if req.area_sqm > 250:
+            decay = (250 / req.area_sqm) ** 0.22  # logaritmik azalış
+            decay = max(decay, 0.15)              # en fazla %85 indirim yapabilir
+            base *= decay
 
     # Kiralık için aylık kira hesapla (Amortisman)
     if req.transaction_type == 'rent':
@@ -129,13 +151,100 @@ def apply_sherefiye(base_price: float, req: ValuationRequest) -> float:
             extra = min(req.terrace_sqm / req.area_sqm, 0.3) * 0.5  # Max %15 etki
             m *= (1 + extra)
 
-    elif req.property_type == 'land':
-        zoning_mult = {
-            'imarli': 1.5,
-            'tarla': 0.7,
-            'zeytinlik': 0.6
+        # Cephe Şerefiyesi
+        cephe_mult = {
+            'guney': 1.05,
+            'guney_dogu': 1.03, 'guney_bati': 1.03,
+            'dogu': 1.0, 'bati': 1.0,
+            'kuzey': 0.92,
+            'kuzey_dogu': 0.94, 'kuzey_bati': 0.94
         }
-        m *= zoning_mult.get(req.zoning or 'imarli', 1.0)
+        m *= cephe_mult.get(req.cephe or 'guney', 1.0)
+
+        # Isıtma Tipi
+        heating_mult = {
+            'yerden_isitma': 1.08,
+            'kombi': 1.05,
+            'merkezi': 1.02,
+            'klima': 0.95,
+            'soba': 0.80
+        }
+        m *= heating_mult.get(req.isitma_tipi or 'kombi', 1.0)
+
+        # Site İçinde
+        if req.site_icinde == 'evet':
+            m *= 1.15
+
+        # Otopark
+        otopark_mult = {
+            'kapali': 1.08,
+            'acik': 1.03,
+            'yok': 1.0
+        }
+        m *= otopark_mult.get(req.otopark or 'yok', 1.0)
+
+        # Asansör
+        if req.asansor == 'evet' and req.total_floors and req.total_floors > 3:
+            m *= 1.04
+
+    elif req.property_type == 'land':
+        # İmar Tipi Çarpanı (Endeksa Modeli)
+        # İmarsız tarla imarlı arsadan çok daha ucuzdur!
+        imar_mult = {
+            'konut': 1.0,          # İmarlı konut parseli
+            'konut_ticari': 1.30,  # Konut + Ticari (Çok değerli)
+            'villa': 1.15,         # Özel villa imarlı
+            'koyici': 0.45,        # Köy yerleşik alanı imarı
+            'ticari': 1.40,        # Sadece ticari imarlı
+            'imarsiz': 0.08        # Tarla / İmarsız tarım arazisi (92% ucuz!)
+        }
+        m *= imar_mult.get(req.imar_tipi or 'konut', 1.0)
+
+        # Hisseli Tapu
+        if req.hisseli == 'evet':
+            m *= 0.75  # Hisseli tapu satışı zordur, %25 değer kaybeder
+
+        # TAKS / KAKS Emsal Etkisi
+        if req.kaks is not None:
+            # Standart emsal 0.60 kabul edelim
+            m *= (1.0 + (req.kaks - 0.60) * 0.40)
+        if req.taks is not None:
+            # Standart taks 0.30 kabul edelim
+            m *= (1.0 + (req.taks - 0.30) * 0.20)
+
+        # Yapılaşma Durumu
+        yapi_mult = {
+            'bos': 1.0,
+            'kullanilan': 0.95,
+            'metruk': 0.90
+        }
+        m *= yapi_mult.get(req.yapilasma_durumu or 'bos', 1.0)
+
+        # Olanaklar
+        if req.olanaklar:
+            olanak_list = req.olanaklar.split(',')
+            
+            # YOL altyapısı yoksa arazi çok değer kaybeder!
+            if 'yol' not in olanak_list:
+                m *= 0.65  # Resmi yolu yoksa %35 değer kaybı!
+            else:
+                m *= 1.05  # Yolu açık ise ufak bir artı
+
+            if 'elektrik' in olanak_list: m *= 1.05
+            if 'su' in olanak_list: m *= 1.05
+            if 'kose' in olanak_list: m *= 1.08
+            if 'ifraz' in olanak_list: m *= 1.12
+            if 'denize_sifir' in olanak_list: m *= 1.80
+            elif 'denize_yakin' in olanak_list: m *= 1.25
+
+        # Manzara
+        if req.manzara:
+            manzara_list = req.manzara.split(',')
+            if 'deniz' in manzara_list: m *= 1.20
+            if 'bogaz' in manzara_list: m *= 1.50
+            if 'gol' in manzara_list: m *= 1.15
+            if 'doga' in manzara_list: m *= 1.05
+            if 'sehir' in manzara_list: m *= 1.03
 
     return base_price * m
 
