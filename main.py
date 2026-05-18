@@ -5,98 +5,103 @@ import pandas as pd
 import numpy as np
 from sklearn.ensemble import IsolationForest
 
-app = FastAPI(title="Emlak Endeks API", version="1.0")
+app = FastAPI(title="Emlak Endeks API - Detaylı", version="2.0")
 
-# Frontend'in (HTML/JS) API'ye istek atabilmesi için CORS ayarları
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Canlıda buraya sitenizin domainini yazmalısınız
+    allow_origins=["*"], 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# İstek (Request) Modeli
 class ValuationRequest(BaseModel):
-    transaction_type: str # 'sale' veya 'rent'
-    property_type: str    # 'apartment' veya 'land'
+    transaction_type: str 
+    property_type: str    
     city: str
     district: str
+    neighborhood: str = None # Yeni eklendi: Mahalle
     area_sqm: float
-    # Opsiyonel alanlar (Daire için)
     rooms: str = None
-    # Opsiyonel alanlar (Arsa için)
+    building_age: int = None # Yeni: Bina Yaşı
+    total_floors: int = None # Yeni: Kat Sayısı
+    current_floor: int = None # Yeni: Bulunduğu Kat
     zoning: str = None
 
-# Örnek Veritabanı Simülasyonu (Gerçek senaryoda PostgreSQL'den çekilir)
-def get_historical_data(district: str, property_type: str, transaction_type: str) -> pd.DataFrame:
-    # Bu fonksiyon veritabanından son 6 aylık verileri çeker
-    # Şimdilik algoritmanın çalışmasını göstermek için dummy data üretiyoruz
-    
+def get_historical_data(req: ValuationRequest) -> pd.DataFrame:
     np.random.seed(42)
-    base_price = 45000 if property_type == 'apartment' else 8000
     
-    # İlçe çarpanları
-    if district == 'urla': base_price *= 1.8
-    elif district == 'karsiyaka': base_price *= 1.3
-    elif district == 'bornova': base_price *= 1.1
+    # 1. ŞEHİR BAZLI TEMEL FİYAT HESAPLAMASI
+    # Türkiye Geneli Ortalama (M2)
+    base_price = 25000 if req.property_type == 'apartment' else 6000
+    
+    # Şehir Çarpanları
+    city = req.city.lower()
+    if city == 'istanbul': base_price *= 2.2
+    elif city == 'izmir': base_price *= 1.4
+    elif city == 'ankara': base_price *= 1.2
+    elif city == 'antalya': base_price *= 1.6
+    elif city == 'mugla': base_price *= 2.0
+    
+    # Kiralık ise satışı kiraya çevir (Amortisman)
+    if req.transaction_type == 'rent':
+        base_price = base_price / (18 * 12) if req.property_type == 'apartment' else base_price / (40 * 12)
 
-    # Kiralık ise temel fiyatı kiraya çevir (Amortisman simülasyonu)
-    if transaction_type == 'rent':
-        base_price = base_price / (18 * 12) if property_type == 'apartment' else base_price / (40 * 12)
+    # 2. ŞEREFİYE VE DETAYLI ÖZELLİK ÇARPANLARI
+    multiplier = 1.0
+    
+    if req.property_type == 'apartment':
+        # Yeni binalar daha değerli
+        if req.building_age is not None:
+            if req.building_age <= 5: multiplier *= 1.15
+            elif req.building_age > 20: multiplier *= 0.85
+            
+        # Ara katlar daha değerli, bodrum/giriş daha ucuz
+        if req.current_floor is not None and req.total_floors is not None:
+            if req.current_floor <= 0: multiplier *= 0.80 # Giriş veya bodrum
+            elif req.current_floor == req.total_floors: multiplier *= 0.95 # En üst kat
+            else: multiplier *= 1.05 # Ara kat
+            
+    elif req.property_type == 'land' and req.zoning == 'imarli':
+        multiplier *= 1.5
 
+    base_price *= multiplier
+
+    # Veri Üretimi
     data = []
-    # 200 adet mantıklı, 10 adet manipülatif (aşırı uç) ilan oluşturalım
     for _ in range(200):
-        sqm = np.random.uniform(80, 200) if property_type == 'apartment' else np.random.uniform(300, 1000)
-        price_sqm = np.random.normal(base_price, base_price * 0.1) # %10 sapmalı gerçekçi fiyatlar
+        sqm = np.random.uniform(80, 200) if req.property_type == 'apartment' else np.random.uniform(300, 1000)
+        price_sqm = np.random.normal(base_price, base_price * 0.1)
         data.append({'price': price_sqm * sqm, 'area_sqm': sqm, 'time_on_market': np.random.randint(5, 45)})
         
-    # 10 adet Şişirilmiş / Manipüle edilmiş ilan ekleyelim (Algoritmanın bunları yakalaması lazım)
-    for _ in range(10):
-        sqm = np.random.uniform(80, 200) if property_type == 'apartment' else np.random.uniform(300, 1000)
-        price_sqm = base_price * np.random.uniform(2.5, 4.0) # Piyasanın 3-4 katı fiyata girilmiş sahte ilanlar
-        data.append({'price': price_sqm * sqm, 'area_sqm': sqm, 'time_on_market': np.random.randint(90, 180)}) # Aylardır satılmıyor
+    for _ in range(10): # Outlier (Sahte) Veriler
+        sqm = np.random.uniform(80, 200) if req.property_type == 'apartment' else np.random.uniform(300, 1000)
+        price_sqm = base_price * np.random.uniform(2.5, 4.0) 
+        data.append({'price': price_sqm * sqm, 'area_sqm': sqm, 'time_on_market': np.random.randint(90, 180)})
         
     return pd.DataFrame(data)
 
 @app.post("/api/valuation")
 def calculate_valuation(req: ValuationRequest):
     try:
-        # 1. Veri Çekme
-        df = get_historical_data(req.district, req.property_type, req.transaction_type)
+        df = get_historical_data(req)
         df['unit_price'] = df['price'] / df['area_sqm']
         initial_count = len(df)
         
-        # 2. ANTİ-MANİPÜLASYON (Isolation Forest)
-        # Aşırı uç fiyatları tespit et ve çıkar
-        iso_forest = IsolationForest(contamination=0.05, random_state=42) # Verinin %5'i anomali kabul edilecek
+        iso_forest = IsolationForest(contamination=0.05, random_state=42)
         df['is_outlier'] = iso_forest.fit_predict(df[['unit_price', 'area_sqm']])
         df_clean = df[df['is_outlier'] != -1].copy()
-        outliers_removed = initial_count - len(df_clean)
         
-        # 3. ZAMAN BAZLI AĞIRLIKLANDIRMA (Hedonik Baskı)
         df_clean['weight'] = 1.0
-        # Uzun süredir piyasada olan ilanların ağırlığını düşür
         df_clean.loc[df_clean['time_on_market'] > 90, 'weight'] = 0.8
-        # Hızlı satılanların ağırlığını artır
         df_clean.loc[df_clean['time_on_market'] < 15, 'weight'] = 1.2
         
-        # 4. AĞIRLIKLI GEOMETRİK ORTALAMA İLE BİRİM FİYAT HESAPLAMA
         weighted_log_sum = np.sum(df_clean['weight'] * np.log(df_clean['unit_price']))
         total_weight = np.sum(df_clean['weight'])
         
         calculated_unit_price = np.exp(weighted_log_sum / total_weight)
-        
-        # 5. KULLANICI GAYRİMENKULÜNÜN DEĞERLEMESİ
         estimated_total_price = calculated_unit_price * req.area_sqm
         
-        # Şerefiyeler (Kat, cephe, imar çarpanları eklenebilir)
-        # Örnek: İmarlı arsa ise değeri artır
-        if req.property_type == 'land' and req.zoning == 'imarli':
-            estimated_total_price *= 1.5
-            calculated_unit_price *= 1.5
-            
         return {
             "success": True,
             "estimated_total_price": round(estimated_total_price),
@@ -104,13 +109,12 @@ def calculate_valuation(req: ValuationRequest):
             "confidence_score": 92 + np.random.randint(-2, 3),
             "market_stats": {
                 "analyzed_listings": initial_count,
-                "manipulative_listings_removed": outliers_removed
+                "manipulative_listings_removed": initial_count - len(df_clean)
             }
         }
-        
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/")
 def read_root():
-    return {"message": "Emlak Endeks API Çalışıyor. Dokümantasyon için /docs adresine gidin."}
+    return {"message": "Emlak Endeks API V2 Çalışıyor."}
